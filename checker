@@ -1,0 +1,101 @@
+#!/usr/bin/env nix-shell
+#!nix-shell -p ruby shellcheck -i ruby
+
+require "json"
+require "open3"
+require "tempfile"
+require "shellwords"
+
+$attr = ARGV[0]
+
+def show_derivation(attr)
+  derivation_json, status = Open3.capture2(
+    "nix",
+    "show-derivation",
+    "-f", "./.",
+    attr,
+  )
+  abort unless status.success?
+  JSON.parse(derivation_json)
+end
+
+# Makes a stand-in script for a derivation
+def script_preamble(derivation)
+  env = derivation["env"]
+
+  env.select { |k, v| !k.match(/Phase$/) }
+    .map do |k,v|
+      # FIXME check how "*Array" are handled e.g. makeFlagsArray
+      "# shellcheck disable=SC2034\n"+
+      "#{k}=#{v.shellescape}"
+    end
+    .push("# End of preamble\n")
+    .join("\n")
+end
+
+# Runs shellcheck on the given string.
+# 
+# The temporary filename can have `name` configured as a basename.
+# The `offset` will be removed from `line` and `endLine` values to compensate
+# for a script preamble.
+def shellcheck(script, name: "script", offset: 0)
+  #shellcheck <(echo '#!/bin/bash'; nix show-derivation -f ./. dbeaver | jq -r .[].env.installPhase)
+  file = Tempfile.new(name)
+  file.write(script)
+  file.close()
+  begin
+    stdout, status = Open3.capture2(
+      "shellcheck",
+      "--shell=bash",
+      "--format=json",
+      file.path
+    )
+  ensure
+    file.close!
+  end
+  errors = JSON.parse(stdout)
+  errors.map do |err|
+    err["line"] -= offset
+    err["endLine"] -= offset
+    err
+  end
+end
+
+$derivation = show_derivation($attr)
+  .values
+  .tap { |values| raise "Doesn't know how to work with #{values.length} derivations." if values.length != 1 }
+  .first
+
+def check_phase(derivation, phase_name)
+  preamble = script_preamble(derivation)
+  phase = derivation["env"][phase_name]
+  #$stderr.puts "\n\n\n"
+  #$stderr.puts preamble+phase
+  #$stderr.puts "\n\n\n"
+  #$stderr.puts phase
+  shellcheck(
+    preamble + phase,
+    name: phase_name,
+    offset: preamble.lines.count
+  )
+    .select do |err|
+      err["line"] >= 0
+    end
+end
+
+phases = $derivation["env"].select { |k, v| k.match(/(Phase)$/) || k.match(/^(pre|post)/) }
+  .keys
+
+results = phases.map do |phase_name|
+  [
+    phase_name,
+    {
+      checked: $derivation["env"][phase_name],
+      result: check_phase($derivation, phase_name),
+    }
+  ]
+end
+  .select { |k,v| v[:result].length > 0 }
+  .to_h
+
+puts results.to_json
